@@ -81,3 +81,48 @@ Ao final do semestre, o sistema demonstrará o fluxo IoT completo, da aquisiçã
 | 6 | API para consumo dos dados | 8–9 |
 | 7 | Dashboard de visualização | 10–11 |
 | 8 | Testes e validação do sistema | 11–12 |
+
+## Código
+
+### Estrutura do repositório
+
+| Pasta | Placa | O que faz |
+|-------|-------|-----------|
+| [`transmissor/`](transmissor) | Heltec WiFi LoRa 32 V3 **a bordo do aeromodelo** | Lê o GPS (NEO-6M) e o GY-91 (MPU9250 + BMP280), mostra os dados no display e transmite a telemetria via LoRa 2 vezes por segundo |
+| [`receptor/`](receptor) | Heltec WiFi LoRa 32 V3 **na estação de solo** | Recebe a telemetria via LoRa, confere o formato, conta pacotes perdidos e repassa as linhas pela serial (`TLM:...`) para o dashboard |
+
+Os dois são projetos **ESP-IDF v6.1** independentes, cada um com o seu `CMakeLists.txt` e
+`sdkconfig`. Cada pasta tem um README próprio com ligações, funcionamento e configuração.
+
+### Formato da telemetria
+
+O transmissor envia uma linha de texto por pacote, com os dados de cada sensor separados por
+`" - "`:
+
+```
+CONTADOR,DATA,LAT,LON,ALT,SATS - ROLL,PITCH,RUMO,ALT_BAR
+42,12/11/2026 20:55:58,-26.229174,-52.672226,727.9,6 - 1.4,6.6,285.0,0.45
+```
+
+O receptor imprime na serial `TLM:<linha recebida> - RSSI,SNR`. A descrição completa dos
+campos, as regras de interpretação (valores zerados, pacotes perdidos, altitude) e um exemplo
+de leitura em Python estão em
+[receptor/README.md, seção "Formato da telemetria"](receptor/README.md#formato-da-telemetria).
+
+> Transmissor, receptor e dashboard dependem do mesmo formato. Qualquer mudança nele deve
+> alterar os três **no mesmo commit**.
+
+### Compilar e gravar
+
+Com o ESP-IDF v6.1 instalado, abra a pasta do projeto desejado na IDE da Espressif (ou no
+terminal do ESP-IDF) e grave cada placa com o seu firmware:
+
+```bash
+cd transmissor
+idf.py -p COMx flash monitor
+```
+
+```bash
+cd receptor
+idf.py -p COMy flash monitor
+```
