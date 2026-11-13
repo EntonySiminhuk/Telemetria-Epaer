@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <math.h>
 #include <time.h>
 #include "driver/uart.h"
 #include "driver/gpio.h"
@@ -11,12 +12,14 @@
 #include "oled.h"
 #include "lora.h"
 #include "gps_filtro.h"
+#include "imu.h"
 
 static const char *TAG = "GPS";
+static const char *TAG_IMU = "IMU";
 static const char *TAG_LORA = "LORA";
 
-// Intervalo entre transmissoes LoRa
-#define LORA_INTERVALO_MS   5000
+// Intervalo entre transmissoes LoRa (2 pacotes/s; com SF7 cada linha ocupa ~150 ms no ar)
+#define LORA_INTERVALO_MS   500
 
 #define GPS_UART    UART_NUM_1
 #define GPS_RX_PIN  4    // ligado ao TX do GPS
@@ -71,29 +74,27 @@ static uint8_t epoca_recebidas;
 static bool epoca_publicada;
 static char epoca_hora[16];
 
-// Pacote enviado pelo LoRa: 21 bytes em binario (em texto seriam ~70)
-typedef struct __attribute__((packed)) {
-    uint8_t  versao;     // formato do pacote (PACOTE_VERSAO)
-    uint8_t  flags;      // bit 0: posicao valida
-    uint16_t contador;   // numero sequencial, para detectar pacotes perdidos
-    uint32_t timestamp;  // Unix time UTC
-    int32_t  lat;        // graus x 10^7
-    int32_t  lon;        // graus x 10^7
-    int32_t  alt;        // decimetros
-    uint8_t  sats;       // satelites usados
-} pacote_t;
-
-_Static_assert(sizeof(pacote_t) == 21, "pacote_t deve ter 21 bytes");
-
-#define PACOTE_VERSAO 1
+// Pacote enviado pelo LoRa: uma linha de texto ASCII (sem '\n'), com os
+// dados de cada sensor separados por " - " (espaco, hifen, espaco):
+//
+//   CONTADOR,DATA,LAT,LON,ALT,SATS - ROLL,PITCH,RUMO,ALT_BAR
+//   42,12/11/2026 20:55:58,-26.229174,-52.672226,727.9,6 - 1.4,6.6,285.0,0.45
+//
+// Formato documentado nos READMEs dos dois projetos: o receptor depende dele.
+// Valores negativos tem '-' colado no numero (",-26.2"), entao separar os
+// blocos SEMPRE por " - " com os espacos, nunca so por '-'.
+#define PACOTE_SEP        " - "
+#define PACOTE_DATA_ZERO  "00/00/0000 00:00:00"   // GPS ainda sem hora
+#define PACOTE_MAX        128                     // pior caso ~90 caracteres
 
 static bool oled_ok;
+static bool imu_ok;
 static int lora_ultimo_enviado = -1;  // contador do ultimo pacote enviado (-1 = nenhum)
 static bool lora_erro;
 
 // ---------------------------------------------------------------------------
-// FORMATO DE SAIDA: altere esta funcao para mudar o que aparece no
-// terminal e no display (21 colunas x 8 linhas)
+// FORMATO DE SAIDA: gps_print() define o que aparece no terminal;
+// tela_gps() e tela_imu() definem o display (21 colunas x 8 linhas)
 // ---------------------------------------------------------------------------
 static const char *fix_str(int fix)
 {
@@ -129,39 +130,6 @@ static void gps_print(const gps_estado_t *e)
     const char *hdop = opcional(buf_hdop, sizeof(buf_hdop), "%.1f", g->hdop);
     const char *erro = opcional(buf_erro, sizeof(buf_erro), "%.1f m", gps_erro_horizontal(g));
 
-    if (oled_ok) {
-        oled_clear();
-        if (g->timestamp) {
-            oled_printf(0, 0, "%02d/%02d/%04d %02d:%02d:%02d.%d",
-                        t.tm_mday, t.tm_mon + 1, t.tm_year + 1900,
-                        t.tm_hour, t.tm_min, t.tm_sec, g->ms / 100);
-        } else {
-            oled_text(0, 0, "GPS NEO-6M");
-        }
-        oled_hline(1);
-        if (aceito) {
-            oled_printf(0, 2, "Lat: %.6f", g->lat);
-            oled_printf(0, 3, "Lon: %.6f", g->lon);
-            oled_printf(0, 4, "Alt: %.1f m", g->alt);
-        } else if (e->motivo == GPS_REJ_SEM_FIX) {
-            oled_text(0, 3, "Aguardando posicao...");
-        } else {
-            oled_text(0, 2, "Posicao rejeitada:");
-            oled_printf(0, 3, "  %s", gps_motivo_str(e->motivo));
-        }
-        // Erro estimado arredondado para caber nas 21 colunas
-        char buf_e[8];
-        oled_printf(0, 5, "%s HDOP:%s e:%s", fix_str(g->fix), hdop,
-                    opcional(buf_e, sizeof(buf_e), "%.0fm", gps_erro_horizontal(g)));
-        oled_printf(0, 6, "Satelites: %d", g->sats);
-        if (lora_erro) {
-            oled_text(0, 7, "LoRa: erro");
-        } else if (lora_ultimo_enviado >= 0) {
-            oled_printf(0, 7, "LoRa: #%d enviado", lora_ultimo_enviado);
-        }
-        oled_update();
-    }
-
     // Terminal: no maximo 1 linha por segundo, com a taxa medida (leituras/s)
     static TickType_t ultimo_log;
     static int leituras;
@@ -189,6 +157,136 @@ static void gps_print(const gps_estado_t *e)
              t.tm_mday, t.tm_mon + 1, t.tm_year + 1900,
              t.tm_hour, t.tm_min, t.tm_sec, g->ms / 100,
              g->lat, g->lon, g->alt, g->sats, hdop, erro, taxa);
+}
+
+// ---------------------------------------------------------------------------
+// Display: alterna entre a tela do GPS e a do GY-91.
+// Depois da inicializacao, so a display_task desenha no OLED.
+// ---------------------------------------------------------------------------
+#define TELA_TROCA_MS     3000   // tempo que cada tela fica visivel
+#define TELA_ATUALIZA_MS  200    // redesenho a 5 Hz
+#define TELA_NUM          2
+
+// Tela 1: GPS (ultima epoca, aprovada ou nao)
+static void tela_gps(void)
+{
+    gps_estado_t e;
+    taskENTER_CRITICAL(&gps_lock);
+    e = gps_ultimo;
+    taskEXIT_CRITICAL(&gps_lock);
+    const gps_leitura_t *g = &e.l;
+
+    if (g->timestamp) {
+        time_t local = g->timestamp + FUSO_HORARIO * 3600;
+        struct tm t;
+        gmtime_r(&local, &t);
+        oled_printf(0, 0, "%02d/%02d/%04d %02d:%02d:%02d.%d",
+                    t.tm_mday, t.tm_mon + 1, t.tm_year + 1900,
+                    t.tm_hour, t.tm_min, t.tm_sec, g->ms / 100);
+    } else {
+        oled_text(0, 0, "GPS NEO-6M");
+    }
+    oled_hline(1);
+
+    // Nenhuma epoca nos ultimos 2 s: GPS desligado ou fio solto
+    if (e.tick == 0 || xTaskGetTickCount() - e.tick > pdMS_TO_TICKS(2000)) {
+        oled_text(0, 3, "GPS sem dados");
+        return;
+    }
+
+    if (e.motivo == GPS_OK) {
+        oled_printf(0, 2, "Lat: %.6f", g->lat);
+        oled_printf(0, 3, "Lon: %.6f", g->lon);
+        oled_printf(0, 4, "Alt: %.1f m", g->alt);
+    } else if (e.motivo == GPS_REJ_SEM_FIX) {
+        oled_text(0, 3, "Aguardando posicao...");
+    } else {
+        oled_text(0, 2, "Posicao rejeitada:");
+        oled_printf(0, 3, "  %s", gps_motivo_str(e.motivo));
+    }
+    // Erro estimado arredondado para caber nas 21 colunas
+    char buf_h[8], buf_e[8];
+    oled_printf(0, 5, "%s HDOP:%s e:%s", fix_str(g->fix),
+                opcional(buf_h, sizeof(buf_h), "%.1f", g->hdop),
+                opcional(buf_e, sizeof(buf_e), "%.0fm", gps_erro_horizontal(g)));
+    oled_printf(0, 6, "Satelites: %d", g->sats);
+}
+
+// Tela 2: GY-91 (atitude, rumo, barometro)
+static void tela_imu(void)
+{
+    imu_estado_t imu = {0};
+    if (!imu_ok) {
+        oled_text(0, 0, "GY-91");
+        oled_hline(1);
+        oled_text(0, 3, "GY-91: falha");
+        oled_text(0, 4, "Confira SDA41/SCL42");
+        return;
+    }
+    if (!imu_obter(&imu)) {
+        oled_text(0, 0, "GY-91");
+        oled_hline(1);
+        oled_text(0, 3, "GY-91 sem dados");
+        return;
+    }
+
+    // Cabecalho: aceleracao total em g (1.00 parado; mostra a carga em voo)
+    const float g_total = sqrtf(imu.ax * imu.ax + imu.ay * imu.ay + imu.az * imu.az);
+    oled_printf(0, 0, "GY-91        G:%5.2f", g_total);
+    oled_hline(1);
+    oled_printf(0, 2, "Roll : %+7.1f graus", imu.roll);
+    oled_printf(0, 3, "Pitch: %+7.1f graus", imu.pitch);
+    if (imu.tem_rumo) {
+        oled_printf(0, 4, "Rumo : %7.1f graus", imu.rumo);
+    } else {
+        oled_text(0, 4, "Rumo :      --");
+    }
+    if (imu.tem_baro) {
+        oled_printf(0, 5, "Alt rel: %+.2f m", imu.alt_rel_m);
+        oled_printf(0, 6, "%.2f hPa  %.1f C", imu.pressao_pa / 100.0f, imu.temp_c);
+    } else {
+        oled_text(0, 5, "Barometro: --");
+        oled_printf(0, 6, "Temp: %.1f C", imu.temp_c);
+    }
+}
+
+// Linha 7, comum as duas telas: status do LoRa e numero da tela
+static void tela_rodape(int tela)
+{
+    if (lora_erro) {
+        oled_text(0, 7, "LoRa: erro");
+    } else if (lora_ultimo_enviado >= 0) {
+        oled_printf(0, 7, "LoRa: #%d", lora_ultimo_enviado);
+    } else {
+        oled_text(0, 7, "LoRa: --");
+    }
+    oled_printf(18, 7, "%d/%d", tela + 1, TELA_NUM);
+}
+
+static void display_task(void *arg)
+{
+    int tela = 0;
+    TickType_t proximo = xTaskGetTickCount();
+    TickType_t troca = proximo;
+
+    while (1) {
+        const TickType_t agora = xTaskGetTickCount();
+        if (agora - troca >= pdMS_TO_TICKS(TELA_TROCA_MS)) {
+            tela = (tela + 1) % TELA_NUM;
+            troca = agora;
+        }
+
+        oled_clear();
+        if (tela == 0) {
+            tela_gps();
+        } else {
+            tela_imu();
+        }
+        tela_rodape(tela);
+        oled_update();
+
+        xTaskDelayUntil(&proximo, pdMS_TO_TICKS(TELA_ATUALIZA_MS));
+    }
 }
 
 #if SAIDA_CSV
@@ -579,13 +677,13 @@ static void gps_task(void *arg)
 // LoRa
 // ---------------------------------------------------------------------------
 
-// Arredonda para o inteiro mais proximo (sem precisar da libm)
-static int32_t arredonda(double v)
+// Zera valores que seriam impressos como "-0.0" (ex.: -0.04 com 1 casa)
+static float sem_menos_zero(float v, float meia_casa)
 {
-    return (int32_t)(v >= 0 ? v + 0.5 : v - 0.5);
+    return (fabsf(v) < meia_casa) ? 0.0f : v;
 }
 
-// TRANSMISSOR: a cada LORA_INTERVALO_MS empacota a ultima leitura e envia
+// TRANSMISSOR: a cada LORA_INTERVALO_MS monta a linha com a ultima leitura e envia
 static void lora_tx_task(void *arg)
 {
     uint16_t contador = 0;
@@ -619,23 +717,53 @@ static void lora_tx_task(void *arg)
             }
         }
 
-        const gps_leitura_t *g = com_posicao ? &aceito.l : &ultimo.l;
-        pacote_t p = {
-            .versao    = PACOTE_VERSAO,
-            .flags     = com_posicao ? 0x01 : 0x00,
-            .contador  = contador,
-            .timestamp = (uint32_t)g->timestamp,
-            .lat       = com_posicao ? arredonda(g->lat * 1e7) : 0,
-            .lon       = com_posicao ? arredonda(g->lon * 1e7) : 0,
-            .alt       = com_posicao ? arredonda(g->alt * 10) : 0,
-            .sats      = (uint8_t)g->sats,
-        };
+        // Atitude: copia publicada pela imu_task (nao acessa o I2C daqui)
+        imu_estado_t imu = {0};
+        const bool com_atitude = imu_ok && imu_obter(&imu);
 
-        esp_err_t err = lora_send((const uint8_t *)&p, sizeof(p));
+        // ---- Bloco do GPS: CONTADOR,DATA,LAT,LON,ALT,SATS ----
+        // Sem posicao aprovada: LAT, LON e ALT zerados. DATA e SATS continuam
+        // reais enquanto o GPS estiver mandando dados (sem dados: zerados tambem).
+        const bool gps_vivo = ultimo.tick != 0 && (agora - ultimo.tick) <= idade_max;
+        const gps_leitura_t *g = com_posicao ? &aceito.l : &ultimo.l;
+
+        char data[64] = PACOTE_DATA_ZERO;   // 20 bastam; 64 cobre o pior caso que o GCC calcula
+        if (gps_vivo && g->timestamp) {
+            time_t local = g->timestamp + FUSO_HORARIO * 3600;
+            struct tm t;
+            gmtime_r(&local, &t);
+            snprintf(data, sizeof(data), "%02d/%02d/%04d %02d:%02d:%02d",
+                     t.tm_mday, t.tm_mon + 1, t.tm_year + 1900, t.tm_hour, t.tm_min, t.tm_sec);
+        }
+        const double lat = com_posicao ? g->lat : 0.0;
+        const double lon = com_posicao ? g->lon : 0.0;
+        const float alt = com_posicao ? g->alt : 0.0f;
+        const int sats = gps_vivo ? g->sats : 0;
+
+        // ---- Bloco do GY-91: ROLL,PITCH,RUMO,ALT_BAR ----
+        // Sensor sem dados: tudo zerado. Sem magnetometro: RUMO 0.
+        const float roll = com_atitude ? sem_menos_zero(imu.roll, 0.05f) : 0.0f;
+        const float pitch = com_atitude ? sem_menos_zero(imu.pitch, 0.05f) : 0.0f;
+        const float rumo = (com_atitude && imu.tem_rumo) ? imu.rumo : 0.0f;
+        const float alt_bar = (com_atitude && imu.tem_alt_rel)
+                              ? sem_menos_zero(imu.alt_rel_m, 0.005f) : 0.0f;
+
+        char linha[PACOTE_MAX];
+        const int n = snprintf(linha, sizeof(linha),
+                               "%u,%s,%.6f,%.6f,%.1f,%d" PACOTE_SEP "%.1f,%.1f,%.1f,%.2f",
+                               contador, data, lat, lon, alt, sats,
+                               roll, pitch, rumo, alt_bar);
+        if (n <= 0 || n >= (int)sizeof(linha)) {
+            ESP_LOGE(TAG_LORA, "Linha do pacote #%u nao coube no buffer", contador);
+            contador++;
+            continue;
+        }
+
+        esp_err_t err = lora_send((const uint8_t *)linha, (size_t)n);
         if (err == ESP_OK) {
             lora_ultimo_enviado = contador;
-            ESP_LOGI(TAG_LORA, "Pacote #%u enviado (%u bytes, %s%s)", contador, (unsigned)sizeof(p),
-                     com_posicao ? "" : "sem posicao: ", estado);
+            ESP_LOGI(TAG_LORA, "#%u enviado (%d bytes, %s%s): %s", contador, n,
+                     com_posicao ? "" : "sem posicao: ", estado, linha);
         } else {
             ESP_LOGW(TAG_LORA, "Falha ao enviar pacote #%u: %s", contador, esp_err_to_name(err));
         }
@@ -650,11 +778,28 @@ void app_main(void)
     esp_err_t err = oled_init();
     oled_ok = (err == ESP_OK);
     if (oled_ok) {
-        oled_text(0, 0, "GPS NEO-6M");
-        oled_text(0, 3, "Iniciando...");
+        oled_text(0, 0, "GPS NEO-6M + GY-91");
+        oled_text(0, 3, "Calibrando IMU...");
+        oled_text(0, 4, "Nao mova a placa");
         oled_update();
     } else {
         ESP_LOGE(TAG, "Falha ao iniciar o display: %s", esp_err_to_name(err));
+    }
+
+    // GY-91 primeiro: a calibracao precisa da placa parada logo ao ligar.
+    // Usa o I2C_NUM_1 (GPIO41/42), separado do OLED (I2C_NUM_0, GPIO17/18).
+    err = imu_iniciar();
+    imu_ok = (err == ESP_OK);
+    if (!imu_ok) {
+        ESP_LOGE(TAG_IMU, "Falha ao iniciar o GY-91: %s (seguindo so com o GPS)",
+                 esp_err_to_name(err));
+    }
+    if (oled_ok) {
+        oled_clear();
+        oled_text(0, 0, "GPS NEO-6M + GY-91");
+        oled_text(0, 3, imu_ok ? "IMU pronta" : "IMU: falha");
+        oled_text(0, 4, "Iniciando GPS...");
+        oled_update();
     }
 
     const uart_config_t cfg = {
@@ -691,9 +836,15 @@ void app_main(void)
     if (err == ESP_OK) {
         ESP_LOGI(TAG_LORA, "Transmissor pronto: %.1f MHz, SF%d, %d dBm, a cada %d ms",
                  LORA_FREQ_HZ / 1e6, LORA_SF, LORA_TX_DBM, LORA_INTERVALO_MS);
-        xTaskCreate(lora_tx_task, "lora_tx_task", 4096, NULL, 4, NULL);
+        xTaskCreate(lora_tx_task, "lora_tx_task", 6144, NULL, 4, NULL);  // log com float
     } else {
         lora_erro = true;
         ESP_LOGE(TAG_LORA, "Falha ao iniciar o radio: %s", esp_err_to_name(err));
+    }
+
+    // A partir daqui so a display_task usa o OLED. Prioridade mais baixa:
+    // o display pode atrasar um pouco sem prejudicar sensores e radio.
+    if (oled_ok) {
+        xTaskCreate(display_task, "display_task", 6144, NULL, 3, NULL);  // printf de float
     }
 }
